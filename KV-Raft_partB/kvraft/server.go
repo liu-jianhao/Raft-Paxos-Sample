@@ -1,6 +1,7 @@
 package raftkv
 
 import (
+	"bytes"
 	"encoding/gob"
 	"labrpc"
 	"log"
@@ -151,7 +152,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	// Your initialization code here.
 
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 100)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.db = make(map[string]string)
@@ -163,33 +164,65 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 		for {
 			// 从Raft中传来的日志
 			msg := <- kv.applyCh
-			// .(type)是类型断言，将接口类型的值Command转换成Op
-			op := msg.Command.(Op)
 
-			kv.mu.Lock()
-			
-			v, ok := kv.ack[op.Id]
-			// 检查ack[op.Id]中是否已经有值，如果有值，请求的值比之前的ReqId大就说明需要写入db
-			if !(ok && v >= op.ReqId) {
-				if op.Type == "Put" {
-					kv.db[op.Key] = op.Value
-				} else if op.Type == "Append" {
-					kv.db[op.Key] += op.Value
+			if msg.UseSnapshot {
+				var LastIncludedIndex int
+				var LastIncludedTerm int
+
+				b := bytes.NewBuffer(msg.Snapshot)
+				d := gob.NewDecoder(b)
+
+				kv.mu.Lock()
+				d.Decode(&LastIncludedIndex)
+				d.Decode(&LastIncludedTerm)
+				kv.db = make(map[string]string)
+				kv.ack = make(map[int64]int)
+				d.Decode(&kv.db)
+				d.Decode(&kv.ack)
+				kv.mu.Unlock()
+			} else {
+				// .(type)是类型断言，将接口类型的值Command转换成Op
+				op := msg.Command.(Op)
+
+				kv.mu.Lock()
+				
+				v, ok := kv.ack[op.Id]
+				// 检查ack[op.Id]中是否已经有值，如果有值，请求的值比之前的ReqId大就说明需要写入db
+				if !(ok && v >= op.ReqId) {
+					if op.Type == "Put" {
+						kv.db[op.Key] = op.Value
+					} else if op.Type == "Append" {
+						kv.db[op.Key] += op.Value
+					}
+
+					// 更新ReqId
+					kv.ack[op.Id] = op.ReqId
 				}
 
-				// 更新ReqId
-				kv.ack[op.Id] = op.ReqId
-			}
+				ch, ok := kv.result[msg.Index]
+				if ok {
+					// select {
+					// case <-kv.result[msg.Index]:
+					// default:
+					// }
+					// 如果通道存在就传送请求op
+					ch <- op
+				} else {
+					kv.result[msg.Index] = make(chan Op, 1)
+				}
 
-			ch, ok := kv.result[msg.Index]
-			if ok {
-				// 如果通道存在就传送请求op
-				ch <- op
-			} else {
-				kv.result[msg.Index] = make(chan Op, 1)
+				// 超过阀值，需要创建快照
+				if maxraftstate != -1 && kv.rf.GetRaftStateSize() > maxraftstate {
+					w := new(bytes.Buffer)	
+					e := gob.NewEncoder(w)
+					e.Encode(kv.db)
+					e.Encode(kv.ack)
+					data := w.Bytes()
+					go kv.rf.StartSnapshot(data, msg.Index)
+				}
+				
+				kv.mu.Unlock()
 			}
-			
-			kv.mu.Unlock()
 		}
 	}()
 
